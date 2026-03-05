@@ -1,268 +1,289 @@
 #!/usr/bin/env python3
 import json, os, re, logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+    CallbackQueryHandler, ContextTypes, filters,
+    ConversationHandler, PreCheckoutQueryHandler
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATA_FILE = "prices.json"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN")
+ADMIN_ID    = int(os.environ.get("ADMIN_ID", "0"))   # ← هتحط ID بتاعك
+DATA_FILE   = "prices.json"
 CHECK_INTERVAL = 3600
+
+# أسعار الاشتراك بالـ Stars
+PRICE_MONTHLY = 100   # 100 Star = شهري
+PRICE_YEARLY  = 900   # 900 Star = سنوي
+
+# حدود المجاني
+FREE_LIMIT = 3
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# مراحل إضافة منتج
 (WAITING_URL, WAITING_SELECTOR, WAITING_NAME,
  WAITING_ALERT_TYPE, WAITING_ALERT_VALUE) = range(5)
-
-# مراحل مراقبة موقع
 WAITING_SITE_URL, WAITING_SITE_SELECTOR, WAITING_SITE_NAME = range(5, 8)
+WAITING_MANUAL_ID, WAITING_MANUAL_MONTHS = range(8, 10)
 
-# ─── النصوص ───
+# ══════════════════════════════════════
+# النصوص
+# ══════════════════════════════════════
 T = {
     "ar": {
         "choose_lang": "👋 أهلاً *{name}*!\nاختار لغتك:",
         "welcome": (
-            "🎉 *أهلاً وسهلاً {name}!*\n\n"
+            "🎉 *أهلاً {name}!*\n\n"
             "أنا بوت تتبع الأسعار الذكي 🛒\n\n"
             "━━━━━━━━━━━━━━\n"
-            "📌 *إيه اللي أقدر أعمله؟*\n\n"
-            "➕ *إضافة منتج* — تابع سعر أي منتج\n"
-            "🌐 *مراقبة موقع* — راقب صفحة عروض كاملة\n"
-            "📋 *منتجاتي* — شوف كل المنتجات\n"
-            "🔍 *فحص الأسعار* — تحقق دلوقتي\n"
-            "🗑️ *حذف منتج* — امسح منتج\n"
-            "📊 *إحصائياتي* — إحصائيات حسابك\n"
-            "❓ *مساعدة* — دليل الاستخدام\n\n"
+            "🆓 *النسخة المجانية:*\n"
+            "• 3 منتجات فقط\n"
+            "• تنبيه أي تغيير\n\n"
+            "💎 *النسخة البريميوم:*\n"
+            "• منتجات غير محدودة\n"
+            "• مراقبة موقع كامل\n"
+            "• تنبيه بنسبة خصم أو سعر معين\n\n"
             "━━━━━━━━━━━━━━\n"
-            "اضغط على أي زرار للبدء! 👇"
+            "اضغط أي زرار للبدء! 👇"
         ),
         "main_menu": "🏠 *القائمة الرئيسية*",
         "add": "➕ إضافة منتج",
-        "watch_site": "🌐 مراقبة موقع",
+        "watch_site": "🌐 مراقبة موقع 💎",
         "list": "📋 منتجاتي",
         "check": "🔍 فحص الأسعار",
         "delete": "🗑️ حذف",
-        "language": "🌐 تغيير اللغة",
+        "subscribe": "💎 اشتراك بريميوم",
         "stats": "📊 إحصائياتي",
         "help": "❓ مساعدة",
+        "language": "🌐 اللغة",
+        # اشتراك
+        "sub_menu": (
+            "💎 *الاشتراك البريميوم*\n\n"
+            "🆓 أنت دلوقتي على النسخة المجانية\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "✨ *مميزات البريميوم:*\n"
+            "• منتجات غير محدودة\n"
+            "• مراقبة صفحة عروض كاملة\n"
+            "• تنبيه بنسبة خصم معينة\n"
+            "• تنبيه لما يوصل سعر معين\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "💳 *اختار طريقة الدفع:*"
+        ),
+        "sub_active": (
+            "💎 *اشتراكك نشط!*\n\n"
+            "📅 ينتهي في: *{date}*\n"
+            "⏳ متبقي: *{days}* يوم\n\n"
+            "شكراً لدعمك! 🙏"
+        ),
+        "stars_monthly": "⭐ شهري — 100 Stars",
+        "stars_yearly": "⭐ سنوي — 900 Stars",
+        "vodafone_pay": "💸 Vodafone Cash / تحويل",
+        "stars_invoice_monthly": "اشتراك شهري — بوت تتبع الأسعار",
+        "stars_invoice_yearly": "اشتراك سنوي — بوت تتبع الأسعار",
+        "sub_success": (
+            "🎉 *تم الاشتراك بنجاح!*\n\n"
+            "💎 أنت الآن عضو بريميوم\n"
+            "📅 ينتهي في: *{date}*\n\n"
+            "استمتع بكل المميزات! 🚀"
+        ),
+        "vodafone_instructions": (
+            "💸 *الدفع عن طريق Vodafone Cash:*\n\n"
+            "1️⃣ حول المبلغ لـ: `01XXXXXXXXX`\n"
+            "2️⃣ ابعت صورة الإيصال هنا\n"
+            "3️⃣ انتظر تأكيد الأدمن\n\n"
+            "💰 الأسعار:\n"
+            "• شهري: *XX جنيه*\n"
+            "• سنوي: *XX جنيه*\n\n"
+            "⏰ التفعيل خلال ساعة"
+        ),
+        "free_limit": (
+            "⚠️ *وصلت للحد المجاني!*\n\n"
+            "النسخة المجانية بتسمح بـ 3 منتجات فقط.\n\n"
+            "💎 اشترك في البريميوم للإضافة بدون حدود!"
+        ),
+        "premium_only": (
+            "💎 *هذه الميزة للمشتركين فقط!*\n\n"
+            "اشترك في البريميوم للاستفادة من:\n"
+            "• مراقبة موقع كامل\n"
+            "• تنبيهات متقدمة\n"
+            "• منتجات غير محدودة"
+        ),
+        # إضافة منتج
         "send_url": "🔗 أرسل رابط المنتج:",
         "send_selector": (
             "🎯 أرسل CSS Selector للسعر:\n\n"
             "مثال: `span.price`\n\n"
-            "📖 *إزاي تجيبه؟*\n"
-            "1️⃣ افتح الموقع في Chrome\n"
-            "2️⃣ كليك يمين على *السعر*\n"
-            "3️⃣ Inspect\n"
-            "4️⃣ كليك يمين على العنصر\n"
-            "5️⃣ Copy ← Copy selector"
+            "إزاي تجيبه؟\n"
+            "1️⃣ Chrome ← كليك يمين على السعر\n"
+            "2️⃣ Inspect\n"
+            "3️⃣ كليك يمين على العنصر\n"
+            "4️⃣ Copy ← Copy selector"
         ),
         "send_name": "✏️ اكتب اسم للمنتج:",
-        "choose_alert": (
-            "🔔 *اختار نوع التنبيه:*\n\n"
-            "1️⃣ أي تغيير في السعر\n"
-            "2️⃣ لما ينزل بنسبة معينة\n"
-            "3️⃣ لما يوصل سعر معين"
-        ),
+        "choose_alert": "🔔 *اختار نوع التنبيه:*",
         "alert_any": "🔔 أي تغيير",
-        "alert_percent": "📉 نسبة خصم",
-        "alert_target": "🎯 سعر معين",
-        "send_percent": "📉 اكتب نسبة الخصم اللي عايز تتنبه ليها:\n\nمثال: اكتب `30` يعني لما السعر ينزل 30% أو أكتر",
-        "send_target": "🎯 اكتب السعر اللي عايز توصله:\n\nمثال: اكتب `100` يعني لما السعر يبقى 100 أو أقل",
+        "alert_percent": "📉 نسبة خصم 💎",
+        "alert_target": "🎯 سعر معين 💎",
+        "send_percent": "📉 اكتب نسبة الخصم:\n\nمثال: `30` = لما ينزل 30% أو أكتر",
+        "send_target": "🎯 اكتب السعر المطلوب:\n\nمثال: `100` = لما يوصل 100 أو أقل",
         "checking": "⏳ جاري فحص السعر...",
-        "added": (
-            "✅ *تمت الإضافة!*\n\n"
-            "📦 *{name}*\n"
-            "💰 السعر الحالي: *{price}*\n"
-            "🔔 نوع التنبيه: *{alert}*\n"
-            "🕐 {time}\n\n"
-            "هتاخد إشعار لما الشرط يتحقق! 🎯"
-        ),
-        "alert_desc_any": "أي تغيير في السعر",
-        "alert_desc_percent": "لما ينزل {val}% أو أكتر",
-        "alert_desc_target": "لما يوصل {val} أو أقل",
+        "added": "✅ *تمت الإضافة!*\n\n📦 *{name}*\n💰 السعر: *{price}*\n🔔 التنبيه: *{alert}*",
+        "alert_desc_any": "أي تغيير",
+        "alert_desc_percent": "نزول {val}% أو أكتر",
+        "alert_desc_target": "وصول {val} أو أقل",
         "error_url": "❌ الرابط غلط! لازم يبدأ بـ https://",
-        "error_price": "❌ مقدرتش أجيب السعر!\nتأكد إن الـ Selector صح.",
-        "error_number": "❌ لازم تكتب رقم صح!\nحاول تاني:",
-        "no_products": "📋 مفيش منتجات متابَعة دلوقتي.",
+        "error_price": "❌ مقدرتش أجيب السعر!\nتأكد من الـ Selector.",
+        "error_number": "❌ لازم تكتب رقم!\nحاول تاني:",
+        "no_products": "📋 مفيش منتجات دلوقتي.",
         "products_title": "📋 *منتجاتي:*\n\n",
         "no_change": "✅ مفيش تغييرات\nآخر فحص: {time}",
         "price_down": "📉 *انخفض السعر!*\n\n📦 *{name}*\n❌ كان: *{old}*\n✅ بقى: *{new}*\n💰 خصم: *{pct}%* 🎉\n\n🔗 {url}",
         "price_up": "📈 *ارتفع السعر!*\n\n📦 *{name}*\n❌ كان: *{old}*\n✅ بقى: *{new}*\n\n🔗 {url}",
-        "price_target": "🎯 *وصل للسعر المطلوب!*\n\n📦 *{name}*\n✅ السعر دلوقتي: *{new}*\n\n🔗 {url}",
-        "deleted": "✅ تم الحذف بنجاح",
+        "price_target": "🎯 *وصل للسعر!*\n\n📦 *{name}*\n✅ السعر: *{new}*\n\n🔗 {url}",
+        "deleted": "✅ تم الحذف",
         "select_delete": "🗑️ اختار اللي عايز تحذفه:",
         "cancel": "❌ تم الإلغاء",
-        "checking_all": "⏳ جاري فحص كل الأسعار...",
+        "checking_all": "⏳ جاري فحص الأسعار...",
         "lang_changed": "✅ تم تغيير اللغة 🇪🇬",
-        "stats_text": (
-            "📊 *إحصائياتك:*\n\n"
-            "📦 منتجات متابَعة: *{products}*\n"
-            "🌐 مواقع تحت المراقبة: *{sites}*\n"
-            "🕐 آخر فحص: *{last_check}*"
-        ),
+        "stats_text": "📊 *إحصائياتك:*\n\n📦 منتجات: *{products}*\n🌐 مواقع: *{sites}*\n💎 الاشتراك: *{sub}*\n🕐 آخر فحص: *{last_check}*",
+        "sub_status_free": "مجاني",
+        "sub_status_premium": "بريميوم حتى {date}",
         "help_text": (
             "❓ *دليل الاستخدام:*\n\n"
-            "━━━━━━━━━━━━━━\n"
             "➕ *إضافة منتج:*\n"
-            "ابعت رابط المنتج ← Selector ← اسم ← نوع التنبيه\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "🌐 *مراقبة موقع كامل:*\n"
-            "ابعت رابط صفحة العروض ← Selector للسعر ← اسم\n"
-            "البوت هيبعتلك كل المنتجات الجديدة في الصفحة\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "⏰ الفحص كل ساعة تلقائياً"
+            "رابط ← Selector ← اسم ← نوع التنبيه\n\n"
+            "🌐 *مراقبة موقع (بريميوم):*\n"
+            "رابط صفحة العروض ← Selector ← اسم\n\n"
+            "💎 *البريميوم:*\n"
+            "اضغط زرار الاشتراك واختار طريقة الدفع\n\n"
+            "⏰ الفحص التلقائي كل ساعة"
         ),
-        # مراقبة موقع
-        "send_site_url": (
-            "🌐 أرسل رابط صفحة العروض أو التخفيضات:\n\n"
-            "مثال:\n"
-            "`https://dkhoonemirates.com/collections/sale`"
-        ),
-        "send_site_selector": (
-            "🎯 أرسل CSS Selector للسعر في الصفحة:\n\n"
-            "مثال: `span.price`"
-        ),
+        "send_site_url": "🌐 أرسل رابط صفحة العروض:\n\nمثال: `https://site.com/sale`",
+        "send_site_selector": "🎯 أرسل Selector للأسعار في الصفحة:",
         "send_site_name": "✏️ اكتب اسم للموقع:",
-        "site_added": (
-            "✅ *تمت إضافة الموقع!*\n\n"
-            "🌐 *{name}*\n"
-            "📦 المنتجات الحالية: *{count}*\n\n"
-            "هتاخد إشعار لما يظهر خصم جديد! 🔔"
-        ),
-        "site_new_deals": (
-            "🔥 *عروض جديدة على {name}!*\n\n"
-            "{deals}\n"
-            "🔗 {url}"
-        ),
-        "no_sites": "🌐 مفيش مواقع تحت المراقبة دلوقتي.",
+        "site_added": "✅ *تمت إضافة الموقع!*\n\n🌐 *{name}*\n📦 منتجات موجودة: *{count}*",
+        "site_new_deals": "🔥 *عروض جديدة على {name}!*\n\n{deals}\n\n🔗 {url}",
+        # أدمن
+        "admin_menu": "👑 *لوحة الأدمن:*",
+        "admin_users": "👥 المستخدمين",
+        "admin_add_sub": "➕ إضافة اشتراك يدوي",
+        "admin_broadcast": "📢 رسالة للكل",
+        "users_list": "👥 *المستخدمين:*\n\n{list}",
+        "enter_user_id": "أرسل ID المستخدم:",
+        "enter_months": "أرسل عدد الأشهر:",
+        "sub_added_admin": "✅ تم تفعيل الاشتراك للمستخدم {uid} لمدة {months} شهر",
+        "sub_activated_user": "💎 *تم تفعيل اشتراكك البريميوم!*\n\n📅 ينتهي في: *{date}*\n\nشكراً لك! 🎉",
+        "not_admin": "❌ مش أدمن!",
+        "vodafone_received": "✅ تم استلام طلب الدفع!\nالأدمن هيتواصل معاك خلال ساعة 🕐",
     },
     "en": {
-        "choose_lang": "👋 Hello *{name}*!\nChoose your language:",
+        "choose_lang": "👋 Hello *{name}*!\nChoose language:",
         "welcome": (
             "🎉 *Welcome {name}!*\n\n"
-            "I'm your Smart Price Tracker Bot 🛒\n\n"
+            "Smart Price Tracker Bot 🛒\n\n"
             "━━━━━━━━━━━━━━\n"
-            "📌 *What can I do?*\n\n"
-            "➕ *Add Product* — Track any product price\n"
-            "🌐 *Watch Site* — Monitor a full deals page\n"
-            "📋 *My Products* — View all tracked items\n"
-            "🔍 *Check Prices* — Check now\n"
-            "🗑️ *Delete* — Remove items\n"
-            "📊 *My Stats* — Your statistics\n"
-            "❓ *Help* — Usage guide\n\n"
+            "🆓 *Free Plan:*\n"
+            "• 3 products only\n"
+            "• Any change alert\n\n"
+            "💎 *Premium Plan:*\n"
+            "• Unlimited products\n"
+            "• Full site monitoring\n"
+            "• % discount & target price alerts\n\n"
             "━━━━━━━━━━━━━━\n"
             "Tap any button to start! 👇"
         ),
         "main_menu": "🏠 *Main Menu*",
         "add": "➕ Add Product",
-        "watch_site": "🌐 Watch Site",
+        "watch_site": "🌐 Watch Site 💎",
         "list": "📋 My Products",
         "check": "🔍 Check Prices",
         "delete": "🗑️ Delete",
-        "language": "🌐 Language",
+        "subscribe": "💎 Premium",
         "stats": "📊 My Stats",
         "help": "❓ Help",
+        "language": "🌐 Language",
+        "sub_menu": (
+            "💎 *Premium Subscription*\n\n"
+            "🆓 You're on the Free plan\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "✨ *Premium Features:*\n"
+            "• Unlimited products\n"
+            "• Full site monitoring\n"
+            "• % discount alerts\n"
+            "• Target price alerts\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "💳 *Choose payment method:*"
+        ),
+        "sub_active": "💎 *Subscription Active!*\n\n📅 Expires: *{date}*\n⏳ Days left: *{days}*\n\nThank you! 🙏",
+        "stars_monthly": "⭐ Monthly — 100 Stars",
+        "stars_yearly": "⭐ Yearly — 900 Stars",
+        "vodafone_pay": "💸 Bank Transfer",
+        "stars_invoice_monthly": "Monthly Subscription — Price Tracker Bot",
+        "stars_invoice_yearly": "Yearly Subscription — Price Tracker Bot",
+        "sub_success": "🎉 *Subscribed Successfully!*\n\n💎 You're now Premium\n📅 Expires: *{date}*\n\nEnjoy all features! 🚀",
+        "vodafone_instructions": "💸 *Bank Transfer Payment:*\n\n1️⃣ Transfer amount to: `XXXXXXXXX`\n2️⃣ Send receipt here\n3️⃣ Wait for admin confirmation\n\n💰 Prices:\n• Monthly: *XX EGP*\n• Yearly: *XX EGP*\n\n⏰ Activation within 1 hour",
+        "free_limit": "⚠️ *Free limit reached!*\n\nFree plan allows 3 products only.\n\n💎 Subscribe to Premium for unlimited products!",
+        "premium_only": "💎 *Premium feature only!*\n\nSubscribe to access:\n• Full site monitoring\n• Advanced alerts\n• Unlimited products",
         "send_url": "🔗 Send the product URL:",
-        "send_selector": (
-            "🎯 Send the CSS Selector for the price:\n\n"
-            "Example: `span.price`\n\n"
-            "📖 *How to get it?*\n"
-            "1️⃣ Open in Chrome\n"
-            "2️⃣ Right-click the price\n"
-            "3️⃣ Inspect\n"
-            "4️⃣ Right-click element\n"
-            "5️⃣ Copy ← Copy selector"
-        ),
-        "send_name": "✏️ Enter a name for this product:",
-        "choose_alert": (
-            "🔔 *Choose alert type:*\n\n"
-            "1️⃣ Any price change\n"
-            "2️⃣ When drops by a percentage\n"
-            "3️⃣ When reaches a target price"
-        ),
+        "send_selector": "🎯 Send CSS Selector for price:\n\nExample: `span.price`",
+        "send_name": "✏️ Enter product name:",
+        "choose_alert": "🔔 *Choose alert type:*",
         "alert_any": "🔔 Any Change",
-        "alert_percent": "📉 % Discount",
-        "alert_target": "🎯 Target Price",
-        "send_percent": "📉 Enter the discount % to alert you:\n\nExample: `30` means when price drops 30% or more",
-        "send_target": "🎯 Enter your target price:\n\nExample: `100` means when price reaches 100 or less",
+        "alert_percent": "📉 % Discount 💎",
+        "alert_target": "🎯 Target Price 💎",
+        "send_percent": "📉 Enter discount %:\n\nExample: `30` = alert when drops 30% or more",
+        "send_target": "🎯 Enter target price:\n\nExample: `100` = alert when reaches 100 or less",
         "checking": "⏳ Checking price...",
-        "added": (
-            "✅ *Product Added!*\n\n"
-            "📦 *{name}*\n"
-            "💰 Current Price: *{price}*\n"
-            "🔔 Alert Type: *{alert}*\n"
-            "🕐 {time}\n\n"
-            "You'll be notified when condition is met! 🎯"
-        ),
-        "alert_desc_any": "Any price change",
-        "alert_desc_percent": "When drops {val}% or more",
-        "alert_desc_target": "When reaches {val} or less",
+        "added": "✅ *Added!*\n\n📦 *{name}*\n💰 Price: *{price}*\n🔔 Alert: *{alert}*",
+        "alert_desc_any": "Any change",
+        "alert_desc_percent": "Drop {val}% or more",
+        "alert_desc_target": "Reach {val} or less",
         "error_url": "❌ Invalid URL! Must start with https://",
-        "error_price": "❌ Couldn't fetch the price!\nCheck the Selector.",
-        "error_number": "❌ Please enter a valid number!\nTry again:",
+        "error_price": "❌ Couldn't fetch price!\nCheck the Selector.",
+        "error_number": "❌ Enter a valid number!\nTry again:",
         "no_products": "📋 No products tracked yet.",
         "products_title": "📋 *My Products:*\n\n",
-        "no_change": "✅ No price changes\nLast check: {time}",
+        "no_change": "✅ No changes\nLast check: {time}",
         "price_down": "📉 *Price Dropped!*\n\n📦 *{name}*\n❌ Was: *{old}*\n✅ Now: *{new}*\n💰 Discount: *{pct}%* 🎉\n\n🔗 {url}",
         "price_up": "📈 *Price Increased!*\n\n📦 *{name}*\n❌ Was: *{old}*\n✅ Now: *{new}*\n\n🔗 {url}",
-        "price_target": "🎯 *Target Price Reached!*\n\n📦 *{name}*\n✅ Price now: *{new}*\n\n🔗 {url}",
-        "deleted": "✅ Deleted successfully",
-        "select_delete": "🗑️ Choose what to delete:",
+        "price_target": "🎯 *Target Reached!*\n\n📦 *{name}*\n✅ Price: *{new}*\n\n🔗 {url}",
+        "deleted": "✅ Deleted",
+        "select_delete": "🗑️ Choose to delete:",
         "cancel": "❌ Cancelled",
         "checking_all": "⏳ Checking all prices...",
         "lang_changed": "✅ Language changed 🇬🇧",
-        "stats_text": (
-            "📊 *Your Stats:*\n\n"
-            "📦 Tracked Products: *{products}*\n"
-            "🌐 Watched Sites: *{sites}*\n"
-            "🕐 Last Check: *{last_check}*"
-        ),
-        "help_text": (
-            "❓ *Usage Guide:*\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "➕ *Add Product:*\n"
-            "Send URL ← Selector ← Name ← Alert type\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "🌐 *Watch Site:*\n"
-            "Send deals page URL ← Price Selector ← Name\n"
-            "Bot notifies you of new deals on the page\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "⏰ Auto-checks every hour"
-        ),
-        "send_site_url": (
-            "🌐 Send the deals/sale page URL:\n\n"
-            "Example:\n"
-            "`https://dkhoonemirates.com/collections/sale`"
-        ),
-        "send_site_selector": (
-            "🎯 Send the CSS Selector for prices on this page:\n\n"
-            "Example: `span.price`"
-        ),
-        "send_site_name": "✏️ Enter a name for this site:",
-        "site_added": (
-            "✅ *Site Added!*\n\n"
-            "🌐 *{name}*\n"
-            "📦 Current products found: *{count}*\n\n"
-            "You'll be notified of new deals! 🔔"
-        ),
-        "site_new_deals": (
-            "🔥 *New deals on {name}!*\n\n"
-            "{deals}\n"
-            "🔗 {url}"
-        ),
-        "no_sites": "🌐 No sites being watched yet.",
+        "stats_text": "📊 *Your Stats:*\n\n📦 Products: *{products}*\n🌐 Sites: *{sites}*\n💎 Plan: *{sub}*\n🕐 Last Check: *{last_check}*",
+        "sub_status_free": "Free",
+        "sub_status_premium": "Premium until {date}",
+        "help_text": "❓ *Usage Guide:*\n\n➕ *Add Product:*\nURL ← Selector ← Name ← Alert type\n\n🌐 *Watch Site (Premium):*\nDeals page URL ← Selector ← Name\n\n💎 *Premium:*\nTap Subscribe button\n\n⏰ Auto-check every hour",
+        "send_site_url": "🌐 Send deals page URL:\n\nExample: `https://site.com/sale`",
+        "send_site_selector": "🎯 Send Selector for prices on this page:",
+        "send_site_name": "✏️ Enter site name:",
+        "site_added": "✅ *Site Added!*\n\n🌐 *{name}*\n📦 Products found: *{count}*",
+        "site_new_deals": "🔥 *New deals on {name}!*\n\n{deals}\n\n🔗 {url}",
+        "admin_menu": "👑 *Admin Panel:*",
+        "admin_users": "👥 Users",
+        "admin_add_sub": "➕ Add Subscription",
+        "admin_broadcast": "📢 Broadcast",
+        "users_list": "👥 *Users:*\n\n{list}",
+        "enter_user_id": "Send user ID:",
+        "enter_months": "Send number of months:",
+        "sub_added_admin": "✅ Subscription activated for {uid} for {months} months",
+        "sub_activated_user": "💎 *Your Premium subscription is active!*\n\n📅 Expires: *{date}*\n\nThank you! 🎉",
+        "not_admin": "❌ Not admin!",
+        "vodafone_received": "✅ Payment request received!\nAdmin will contact you within 1 hour 🕐",
     }
 }
 
-# ─── البيانات ───
+# ══════════════════════════════════════
+# البيانات
+# ══════════════════════════════════════
 def load_data():
     if Path(DATA_FILE).exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -298,18 +319,60 @@ def price_to_float(s):
     except:
         return None
 
-# ─── الكيبورد ───
+# ── اشتراك ──
+def is_premium(chat_id):
+    data = load_data()
+    sub = data.get(str(chat_id), {}).get("subscription")
+    if not sub:
+        return False
+    expiry = datetime.fromisoformat(sub["expiry"])
+    return expiry > datetime.now()
+
+def add_subscription(chat_id, months):
+    data = load_data()
+    cid = str(chat_id)
+    if cid not in data:
+        data[cid] = {}
+    now = datetime.now()
+    current = data[cid].get("subscription")
+    if current:
+        try:
+            base = datetime.fromisoformat(current["expiry"])
+            if base > now:
+                expiry = base + timedelta(days=30 * months)
+            else:
+                expiry = now + timedelta(days=30 * months)
+        except:
+            expiry = now + timedelta(days=30 * months)
+    else:
+        expiry = now + timedelta(days=30 * months)
+    data[cid]["subscription"] = {"expiry": expiry.isoformat(), "activated": now.isoformat()}
+    save_data(data)
+    return expiry.strftime("%Y-%m-%d")
+
+# ══════════════════════════════════════
+# الكيبورد
+# ══════════════════════════════════════
 def main_keyboard(chat_id):
     lang = get_lang(chat_id) or "ar"
     txt = T[lang]
     return ReplyKeyboardMarkup([
         [KeyboardButton(txt["add"]), KeyboardButton(txt["watch_site"])],
         [KeyboardButton(txt["list"]), KeyboardButton(txt["check"])],
-        [KeyboardButton(txt["stats"]), KeyboardButton(txt["help"])],
-        [KeyboardButton(txt["delete"]), KeyboardButton(txt["language"])],
+        [KeyboardButton(txt["subscribe"]), KeyboardButton(txt["stats"])],
+        [KeyboardButton(txt["delete"]), KeyboardButton(txt["help"])],
+        [KeyboardButton(txt["language"])],
     ], resize_keyboard=True)
 
-# ─── جلب الأسعار ───
+def admin_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("👥 المستخدمين"), KeyboardButton("➕ اشتراك يدوي")],
+        [KeyboardButton("📊 إحصائيات"), KeyboardButton("🏠 رجوع")],
+    ], resize_keyboard=True)
+
+# ══════════════════════════════════════
+# جلب الأسعار
+# ══════════════════════════════════════
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "ar,en;q=0.9",
@@ -331,29 +394,34 @@ async def fetch_price(url, selector):
     return None
 
 async def fetch_all_prices(url, selector):
-    """جلب كل الأسعار من صفحة كاملة"""
     try:
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
             r = await client.get(url)
             r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        elements = soup.select(selector)
         prices = []
-        for el in elements[:20]:
+        for el in soup.select(selector)[:20]:
             text = el.get_text().strip()
             match = re.search(r"[\d,،.]+", text.replace("\xa0", " "))
             if match:
                 prices.append(match.group(0))
         return prices
-    except Exception as e:
-        logger.warning(f"fetch_all_prices: {e}")
-    return []
+    except:
+        return []
 
-# ─── Start ───
+# ══════════════════════════════════════
+# Start & اللغة
+# ══════════════════════════════════════
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     name = get_name(update.effective_user)
     lang = get_lang(chat_id)
+    # سجل المستخدم
+    data = load_data()
+    cid = str(chat_id)
+    if cid not in data:
+        data[cid] = {"joined": datetime.now().isoformat()}
+        save_data(data)
     if lang:
         await update.message.reply_text(
             t(chat_id, "welcome", name=name),
@@ -384,11 +452,116 @@ async def lang_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(chat_id)
     )
 
-# ════════════════════════════════
-# ─── إضافة منتج ───
-# ════════════════════════════════
+# ══════════════════════════════════════
+# الاشتراك
+# ══════════════════════════════════════
+async def subscribe_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    lang = get_lang(chat_id) or "ar"
+    txt = T[lang]
+
+    if is_premium(chat_id):
+        data = load_data()
+        sub = data[str(chat_id)]["subscription"]
+        expiry = datetime.fromisoformat(sub["expiry"])
+        days = (expiry - datetime.now()).days
+        await update.message.reply_text(
+            t(chat_id, "sub_active", date=expiry.strftime("%Y-%m-%d"), days=days),
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(chat_id)
+        )
+        return
+
+    await update.message.reply_text(
+        t(chat_id, "sub_menu"),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(txt["stars_monthly"], callback_data="pay_stars_1")],
+            [InlineKeyboardButton(txt["stars_yearly"],  callback_data="pay_stars_12")],
+            [InlineKeyboardButton(txt["vodafone_pay"],  callback_data="pay_vodafone")],
+        ])
+    )
+
+async def payment_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    await query.answer()
+
+    if query.data == "pay_stars_1":
+        await ctx.bot.send_invoice(
+            chat_id=chat_id,
+            title="💎 اشتراك شهري" if (get_lang(chat_id) or "ar") == "ar" else "💎 Monthly Premium",
+            description=t(chat_id, "stars_invoice_monthly"),
+            payload="premium_1month",
+            currency="XTR",
+            prices=[LabeledPrice("Premium Monthly", PRICE_MONTHLY)],
+        )
+    elif query.data == "pay_stars_12":
+        await ctx.bot.send_invoice(
+            chat_id=chat_id,
+            title="💎 اشتراك سنوي" if (get_lang(chat_id) or "ar") == "ar" else "💎 Yearly Premium",
+            description=t(chat_id, "stars_invoice_yearly"),
+            payload="premium_12months",
+            currency="XTR",
+            prices=[LabeledPrice("Premium Yearly", PRICE_YEARLY)],
+        )
+    elif query.data == "pay_vodafone":
+        await query.edit_message_text(
+            t(chat_id, "vodafone_instructions"),
+            parse_mode="Markdown"
+        )
+        # بعت إشعار للأدمن
+        if ADMIN_ID:
+            data = load_data()
+            name = data.get(str(chat_id), {}).get("first_name", str(chat_id))
+            await ctx.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"💸 *طلب دفع جديد!*\n\nالمستخدم: {chat_id}\nالاسم: {name}",
+                parse_mode="Markdown"
+            )
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=t(chat_id, "vodafone_received"),
+            reply_markup=main_keyboard(chat_id)
+        )
+
+async def precheckout_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    payload = update.message.successful_payment.invoice_payload
+    months = 12 if "12months" in payload else 1
+    expiry_date = add_subscription(chat_id, months)
+    await update.message.reply_text(
+        t(chat_id, "sub_success", date=expiry_date),
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(chat_id)
+    )
+    if ADMIN_ID:
+        await ctx.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⭐ *دفع ناجح!*\nالمستخدم: {chat_id}\nالمدة: {months} شهر",
+            parse_mode="Markdown"
+        )
+
+# ══════════════════════════════════════
+# إضافة منتج
+# ══════════════════════════════════════
 async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    data = load_data()
+    products = data.get(str(chat_id), {}).get("products", {})
+    if not is_premium(chat_id) and len(products) >= FREE_LIMIT:
+        await update.message.reply_text(
+            t(chat_id, "free_limit"),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💎 اشترك الآن", callback_data="open_sub")
+            ]])
+        )
+        return ConversationHandler.END
     await update.message.reply_text(t(chat_id, "send_url"))
     return WAITING_URL
 
@@ -413,44 +586,54 @@ async def add_name_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["name"] = update.message.text.strip()
     lang = get_lang(chat_id) or "ar"
     txt = T[lang]
+    premium = is_premium(chat_id)
+    keyboard = [[
+        InlineKeyboardButton(txt["alert_any"], callback_data="alert_any"),
+    ]]
+    if premium:
+        keyboard.append([
+            InlineKeyboardButton(txt["alert_percent"], callback_data="alert_percent"),
+            InlineKeyboardButton(txt["alert_target"],  callback_data="alert_target"),
+        ])
+    else:
+        keyboard.append([InlineKeyboardButton("🔒 " + txt["alert_percent"] + " (بريميوم)", callback_data="alert_locked")])
+        keyboard.append([InlineKeyboardButton("🔒 " + txt["alert_target"]  + " (بريميوم)", callback_data="alert_locked")])
+
     await update.message.reply_text(
         t(chat_id, "choose_alert"),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(txt["alert_any"], callback_data="alert_any"),
-            InlineKeyboardButton(txt["alert_percent"], callback_data="alert_percent"),
-            InlineKeyboardButton(txt["alert_target"], callback_data="alert_target"),
-        ]])
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return WAITING_ALERT_TYPE
 
 async def alert_type_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = query.message.chat_id
-    alert_type = query.data.replace("alert_", "")
-    ctx.user_data["alert_type"] = alert_type
     await query.answer()
 
-    if alert_type == "any":
+    if query.data == "alert_locked":
+        await query.answer(t(chat_id, "premium_only"), show_alert=True)
+        return WAITING_ALERT_TYPE
+
+    ctx.user_data["alert_type"] = query.data.replace("alert_", "")
+    if ctx.user_data["alert_type"] == "any":
         await query.edit_message_text("✅ " + t(chat_id, "alert_desc_any"))
         await _finish_add(ctx, chat_id)
         return ConversationHandler.END
-    elif alert_type == "percent":
+    elif ctx.user_data["alert_type"] == "percent":
         await query.edit_message_text(t(chat_id, "send_percent"), parse_mode="Markdown")
-        return WAITING_ALERT_VALUE
     else:
         await query.edit_message_text(t(chat_id, "send_target"), parse_mode="Markdown")
-        return WAITING_ALERT_VALUE
+    return WAITING_ALERT_VALUE
 
 async def alert_value_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    val = update.message.text.strip()
     try:
-        float(val)
+        float(update.message.text.strip())
     except:
         await update.message.reply_text(t(chat_id, "error_number"))
         return WAITING_ALERT_VALUE
-    ctx.user_data["alert_value"] = val
+    ctx.user_data["alert_value"] = update.message.text.strip()
     await _finish_add(ctx, chat_id, update)
     return ConversationHandler.END
 
@@ -460,23 +643,18 @@ async def _finish_add(ctx, chat_id, update=None):
     selector = ctx.user_data["selector"]
     name = ctx.user_data["name"]
     alert_type = ctx.user_data.get("alert_type", "any")
-    alert_value = ctx.user_data.get("alert_value", None)
+    alert_value = ctx.user_data.get("alert_value")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lang = get_lang(chat_id) or "ar"
 
     msg = await ctx.bot.send_message(chat_id=chat_id, text=t(int(chat_id), "checking"))
     price = await fetch_price(url, selector)
     await msg.delete()
 
     if not price:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=t(int(chat_id), "error_price"),
-            parse_mode="Markdown",
-            reply_markup=main_keyboard(int(chat_id))
-        )
+        await ctx.bot.send_message(chat_id=chat_id, text=t(int(chat_id), "error_price"), parse_mode="Markdown", reply_markup=main_keyboard(int(chat_id)))
         return
 
-    lang = get_lang(chat_id) or "ar"
     if alert_type == "any":
         alert_desc = T[lang]["alert_desc_any"]
     elif alert_type == "percent":
@@ -500,7 +678,7 @@ async def _finish_add(ctx, chat_id, update=None):
 
     await ctx.bot.send_message(
         chat_id=chat_id,
-        text=t(int(chat_id), "added", name=name, price=price, alert=alert_desc, time=now),
+        text=t(int(chat_id), "added", name=name, price=price, alert=alert_desc),
         parse_mode="Markdown",
         reply_markup=main_keyboard(int(chat_id))
     )
@@ -510,11 +688,18 @@ async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(chat_id, "cancel"), reply_markup=main_keyboard(chat_id))
     return ConversationHandler.END
 
-# ════════════════════════════════
-# ─── مراقبة موقع كامل ───
-# ════════════════════════════════
+# ══════════════════════════════════════
+# مراقبة موقع
+# ══════════════════════════════════════
 async def watch_site_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if not is_premium(chat_id):
+        await update.message.reply_text(
+            t(chat_id, "premium_only"),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 اشترك", callback_data="open_sub")]])
+        )
+        return ConversationHandler.END
     await update.message.reply_text(t(chat_id, "send_site_url"), parse_mode="Markdown")
     return WAITING_SITE_URL
 
@@ -570,9 +755,9 @@ async def watch_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(chat_id, "cancel"), reply_markup=main_keyboard(chat_id))
     return ConversationHandler.END
 
-# ════════════════════════════════
-# ─── عرض المنتجات ───
-# ════════════════════════════════
+# ══════════════════════════════════════
+# عرض / فحص / حذف
+# ══════════════════════════════════════
 async def list_products(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
@@ -585,23 +770,18 @@ async def list_products(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = ""
     lang = get_lang(int(chat_id)) or "ar"
-
     if products:
         text += T[lang]["products_title"]
         for pid, p in products.items():
-            alert_icon = "🔔" if p.get("alert_type") == "any" else "📉" if p.get("alert_type") == "percent" else "🎯"
-            text += f"*{pid}.* 📦 {p['name']}\n   💰 *{p['price']}* {alert_icon}\n   🔗 {p['url'][:40]}...\n\n"
-
+            icon = "🔔" if p.get("alert_type") == "any" else "📉" if p.get("alert_type") == "percent" else "🎯"
+            text += f"*{pid}.* 📦 {p['name']}\n   💰 *{p['price']}* {icon}\n   🔗 {p['url'][:40]}...\n\n"
     if sites:
-        text += "🌐 *المواقع تحت المراقبة:*\n\n"
+        text += "🌐 *المواقع:*\n\n"
         for sid, s in sites.items():
             text += f"*{sid}.* 🌐 {s['name']}\n   🔗 {s['url'][:40]}...\n\n"
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(int(chat_id)))
 
-# ════════════════════════════════
-# ─── فحص الأسعار ───
-# ════════════════════════════════
 async def check_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
@@ -613,56 +793,39 @@ async def check_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(t(int(chat_id), "checking_all"))
-    changed = 0
 
     for pid, p in products.items():
         new_price = await fetch_price(p["url"], p["selector"])
         if not new_price or new_price == p["price"]:
             continue
-
-        old_f = price_to_float(p["price"])
-        new_f = price_to_float(new_price)
+        old_f, new_f = price_to_float(p["price"]), price_to_float(new_price)
         alert_type = p.get("alert_type", "any")
         alert_value = p.get("alert_value")
         should_notify = False
-        msg_key = "price_changed"
+        msg_key = "price_down"
 
         if alert_type == "any":
             should_notify = True
             msg_key = "price_down" if (old_f and new_f and new_f < old_f) else "price_up"
-        elif alert_type == "percent" and old_f and new_f:
-            pct = ((old_f - new_f) / old_f) * 100
-            if new_f < old_f and pct >= float(alert_value or 0):
+        elif alert_type == "percent" and old_f and new_f and new_f < old_f:
+            if ((old_f - new_f) / old_f * 100) >= float(alert_value or 0):
                 should_notify = True
-                msg_key = "price_down"
-        elif alert_type == "target" and new_f:
-            if new_f <= float(alert_value or 0):
-                should_notify = True
-                msg_key = "price_target"
+        elif alert_type == "target" and new_f and new_f <= float(alert_value or 0):
+            should_notify = True
+            msg_key = "price_target"
 
         if should_notify:
             data[chat_id]["products"][pid]["price"] = new_price
-            changed += 1
-            old_f2 = price_to_float(p["price"])
-            new_f2 = price_to_float(new_price)
-            pct_val = round(((old_f2 - new_f2) / old_f2) * 100) if old_f2 and new_f2 else 0
+            pct = round((old_f - new_f) / old_f * 100) if old_f and new_f else 0
             await update.message.reply_text(
-                t(int(chat_id), msg_key, name=p["name"], old=p["price"], new=new_price, pct=pct_val, url=p["url"]),
+                t(int(chat_id), msg_key, name=p["name"], old=p["price"], new=new_price, pct=pct, url=p["url"]),
                 parse_mode="Markdown"
             )
 
     data[chat_id]["last_check"] = now
     save_data(data)
+    await update.message.reply_text(t(int(chat_id), "no_change", time=now), reply_markup=main_keyboard(int(chat_id)))
 
-    if changed == 0:
-        await update.message.reply_text(
-            t(int(chat_id), "no_change", time=now),
-            reply_markup=main_keyboard(int(chat_id))
-        )
-
-# ════════════════════════════════
-# ─── حذف ───
-# ════════════════════════════════
 async def delete_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
@@ -679,10 +842,7 @@ async def delete_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for sid, s in sites.items():
         keyboard.append([InlineKeyboardButton(f"🌐 {s['name']}", callback_data=f"del_s_{sid}")])
 
-    await update.message.reply_text(
-        t(int(chat_id), "select_delete"),
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text(t(int(chat_id), "select_delete"), reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -691,23 +851,18 @@ async def delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data.startswith("del_p_"):
         pid = query.data.replace("del_p_", "")
-        if pid in data.get(chat_id, {}).get("products", {}):
-            del data[chat_id]["products"][pid]
+        data.get(chat_id, {}).get("products", {}).pop(pid, None)
     elif query.data.startswith("del_s_"):
         sid = query.data.replace("del_s_", "")
-        if sid in data.get(chat_id, {}).get("sites", {}):
-            del data[chat_id]["sites"][sid]
+        data.get(chat_id, {}).get("sites", {}).pop(sid, None)
 
     save_data(data)
-    await query.edit_message_text(t(int(chat_id), "deleted"), parse_mode="Markdown")
-    await ctx.bot.send_message(
-        chat_id=int(chat_id),
-        text=t(int(chat_id), "main_menu"),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(int(chat_id))
-    )
+    await query.edit_message_text(t(int(chat_id), "deleted"))
+    await ctx.bot.send_message(chat_id=int(chat_id), text=t(int(chat_id), "main_menu"), parse_mode="Markdown", reply_markup=main_keyboard(int(chat_id)))
 
-# ─── إحصائيات ───
+# ══════════════════════════════════════
+# إحصائيات ومساعدة
+# ══════════════════════════════════════
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
@@ -715,22 +870,25 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     products = len(user_data.get("products", {}))
     sites = len(user_data.get("sites", {}))
     last_check = user_data.get("last_check", "—")
+    lang = get_lang(int(chat_id)) or "ar"
+
+    if is_premium(int(chat_id)):
+        sub = user_data.get("subscription", {})
+        expiry = datetime.fromisoformat(sub["expiry"]).strftime("%Y-%m-%d")
+        sub_text = T[lang]["sub_status_premium"].format(date=expiry)
+    else:
+        sub_text = T[lang]["sub_status_free"]
+
     await update.message.reply_text(
-        t(int(chat_id), "stats_text", products=products, sites=sites, last_check=last_check),
+        t(int(chat_id), "stats_text", products=products, sites=sites, sub=sub_text, last_check=last_check),
         parse_mode="Markdown",
         reply_markup=main_keyboard(int(chat_id))
     )
 
-# ─── مساعدة ───
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        t(chat_id, "help_text"),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(chat_id)
-    )
+    await update.message.reply_text(t(chat_id, "help_text"), parse_mode="Markdown", reply_markup=main_keyboard(chat_id))
 
-# ─── تغيير اللغة ───
 async def change_language(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "اختار اللغة / Choose language:",
@@ -740,34 +898,99 @@ async def change_language(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]])
     )
 
-# ─── معالج الأزرار ───
+# ══════════════════════════════════════
+# لوحة الأدمن
+# ══════════════════════════════════════
+async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_ID:
+        await update.message.reply_text(t(chat_id, "not_admin"))
+        return
+    data = load_data()
+    total = len([k for k in data.keys() if k.isdigit()])
+    premium_count = sum(1 for k, v in data.items() if k.isdigit() and is_premium(int(k)))
+    await update.message.reply_text(
+        f"👑 *لوحة الأدمن*\n\n👥 المستخدمين: *{total}*\n💎 المشتركين: *{premium_count}*",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard()
+    )
+
+async def admin_add_sub_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_ID:
+        return
+    await update.message.reply_text(t(chat_id, "enter_user_id"))
+    return WAITING_MANUAL_ID
+
+async def admin_add_sub_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        ctx.user_data["manual_uid"] = int(update.message.text.strip())
+        await update.message.reply_text(t(update.effective_chat.id, "enter_months"))
+        return WAITING_MANUAL_MONTHS
+    except:
+        await update.message.reply_text("❌ ID غلط!")
+        return WAITING_MANUAL_ID
+
+async def admin_add_sub_months(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        months = int(update.message.text.strip())
+        uid = ctx.user_data["manual_uid"]
+        expiry_date = add_subscription(uid, months)
+        await update.message.reply_text(
+            t(chat_id, "sub_added_admin", uid=uid, months=months),
+            reply_markup=admin_keyboard()
+        )
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=t(uid, "sub_activated_user", date=expiry_date),
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(uid)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+    return ConversationHandler.END
+
+# ══════════════════════════════════════
+# معالج الأزرار
+# ══════════════════════════════════════
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
     lang = get_lang(chat_id) or "ar"
     txt = T[lang]
 
-    if text == txt["list"]:       await list_products(update, ctx)
-    elif text == txt["check"]:    await check_prices(update, ctx)
-    elif text == txt["delete"]:   await delete_menu(update, ctx)
-    elif text == txt["language"]: await change_language(update, ctx)
-    elif text == txt["stats"]:    await stats(update, ctx)
-    elif text == txt["help"]:     await help_cmd(update, ctx)
+    if text == txt["list"]:         await list_products(update, ctx)
+    elif text == txt["check"]:      await check_prices(update, ctx)
+    elif text == txt["delete"]:     await delete_menu(update, ctx)
+    elif text == txt["language"]:   await change_language(update, ctx)
+    elif text == txt["stats"]:      await stats(update, ctx)
+    elif text == txt["help"]:       await help_cmd(update, ctx)
+    elif text == txt["subscribe"]:  await subscribe_menu(update, ctx)
+    elif text == "👑 أدمن":         await admin_panel(update, ctx)
+    elif text == "🏠 رجوع":
+        await update.message.reply_text(t(chat_id, "main_menu"), parse_mode="Markdown", reply_markup=main_keyboard(chat_id))
 
-# ─── الفحص التلقائي ───
+async def open_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await subscribe_menu(query, ctx)
+
+# ══════════════════════════════════════
+# الفحص التلقائي
+# ══════════════════════════════════════
 async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     for chat_id, user_data in data.items():
-        # فحص المنتجات
+        if not chat_id.isdigit():
+            continue
         for pid, p in user_data.get("products", {}).items():
             new_price = await fetch_price(p["url"], p["selector"])
             if not new_price or new_price == p["price"]:
                 continue
-
-            old_f = price_to_float(p["price"])
-            new_f = price_to_float(new_price)
+            old_f, new_f = price_to_float(p["price"]), price_to_float(new_price)
             alert_type = p.get("alert_type", "any")
             alert_value = p.get("alert_value")
             should_notify = False
@@ -777,34 +1000,27 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                 should_notify = True
                 msg_key = "price_down" if (old_f and new_f and new_f < old_f) else "price_up"
             elif alert_type == "percent" and old_f and new_f and new_f < old_f:
-                pct = ((old_f - new_f) / old_f) * 100
-                if pct >= float(alert_value or 0):
+                if ((old_f - new_f) / old_f * 100) >= float(alert_value or 0):
                     should_notify = True
-                    msg_key = "price_down"
-            elif alert_type == "target" and new_f:
-                if new_f <= float(alert_value or 0):
-                    should_notify = True
-                    msg_key = "price_target"
+            elif alert_type == "target" and new_f and new_f <= float(alert_value or 0):
+                should_notify = True
+                msg_key = "price_target"
 
             if should_notify:
                 data[chat_id]["products"][pid]["price"] = new_price
-                pct_val = round(((old_f - new_f) / old_f) * 100) if old_f and new_f else 0
+                pct = round((old_f - new_f) / old_f * 100) if old_f and new_f else 0
                 try:
                     await ctx.bot.send_message(
                         chat_id=int(chat_id),
-                        text=t(int(chat_id), msg_key, name=p["name"], old=p["price"], new=new_price, pct=pct_val, url=p["url"]),
+                        text=t(int(chat_id), msg_key, name=p["name"], old=p["price"], new=new_price, pct=pct, url=p["url"]),
                         parse_mode="Markdown"
                     )
                 except Exception as e:
-                    logger.error(f"notify error: {e}")
+                    logger.error(f"notify: {e}")
 
-        # فحص المواقع
         for sid, s in user_data.get("sites", {}).items():
             new_prices = await fetch_all_prices(s["url"], s["selector"])
-            old_prices = set(s.get("last_prices", []))
-            new_set = set(new_prices)
-            new_deals = new_set - old_prices
-
+            new_deals = set(new_prices) - set(s.get("last_prices", []))
             if new_deals:
                 data[chat_id]["sites"][sid]["last_prices"] = new_prices
                 deals_text = "\n".join([f"💰 {p}" for p in list(new_deals)[:10]])
@@ -815,37 +1031,36 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                 except Exception as e:
-                    logger.error(f"site notify error: {e}")
+                    logger.error(f"site notify: {e}")
 
         data[chat_id]["last_check"] = now
-
     save_data(data)
 
-# ─── تشغيل البوت ───
+# ══════════════════════════════════════
+# تشغيل البوت
+# ══════════════════════════════════════
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation: إضافة منتج
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
             MessageHandler(filters.Regex(r"^(➕ إضافة منتج|➕ Add Product)$"), add_start),
         ],
         states={
-            WAITING_URL:        [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url)],
-            WAITING_SELECTOR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_selector)],
-            WAITING_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_step)],
-            WAITING_ALERT_TYPE: [CallbackQueryHandler(alert_type_callback, pattern=r"^alert_")],
-            WAITING_ALERT_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND, alert_value_step)],
+            WAITING_URL:         [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url)],
+            WAITING_SELECTOR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_selector)],
+            WAITING_NAME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_step)],
+            WAITING_ALERT_TYPE:  [CallbackQueryHandler(alert_type_callback, pattern=r"^alert_")],
+            WAITING_ALERT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alert_value_step)],
         },
         fallbacks=[CommandHandler("cancel", add_cancel)],
     )
 
-    # Conversation: مراقبة موقع
     site_conv = ConversationHandler(
         entry_points=[
             CommandHandler("watch", watch_site_start),
-            MessageHandler(filters.Regex(r"^(🌐 مراقبة موقع|🌐 Watch Site)$"), watch_site_start),
+            MessageHandler(filters.Regex(r"^(🌐 مراقبة موقع 💎|🌐 Watch Site 💎)$"), watch_site_start),
         ],
         states={
             WAITING_SITE_URL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, watch_site_url)],
@@ -855,12 +1070,27 @@ def main():
         fallbacks=[CommandHandler("cancel", watch_cancel)],
     )
 
+    admin_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^➕ اشتراك يدوي$"), admin_add_sub_start)],
+        states={
+            WAITING_MANUAL_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_sub_id)],
+            WAITING_MANUAL_MONTHS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_sub_months)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang_"))
-    app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del_"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CallbackQueryHandler(lang_callback,     pattern=r"^lang_"))
+    app.add_handler(CallbackQueryHandler(payment_callback,  pattern=r"^pay_"))
+    app.add_handler(CallbackQueryHandler(delete_callback,   pattern=r"^del_"))
+    app.add_handler(CallbackQueryHandler(open_sub_callback, pattern=r"^open_sub$"))
     app.add_handler(add_conv)
     app.add_handler(site_conv)
+    app.add_handler(admin_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_handler))
 
     app.job_queue.run_repeating(auto_check, interval=CHECK_INTERVAL, first=60)
