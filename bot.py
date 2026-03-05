@@ -109,6 +109,34 @@ def add_subscription(chat_id, months):
     save_data(data)
     return expiry.strftime("%Y-%m-%d")
 
+
+def get_subscription_expiry(chat_id):
+    data = load_data()
+    sub = data.get(str(chat_id), {}).get("subscription")
+    if not sub:
+        return None
+    try:
+        return datetime.fromisoformat(sub["expiry"])
+    except:
+        return None
+
+def remaining_seconds(chat_id):
+    expiry = get_subscription_expiry(chat_id)
+    if not expiry:
+        return 0
+    sec = int((expiry - datetime.now()).total_seconds())
+    return max(sec, 0)
+
+def format_remaining_seconds(sec: int):
+    # Returns: "Xd Xh Xm Xs (YYYY seconds)"
+    days = sec // 86400
+    sec2 = sec % 86400
+    hours = sec2 // 3600
+    sec2 %= 3600
+    minutes = sec2 // 60
+    seconds = sec2 % 60
+    return f"{days}d {hours}h {minutes}m {seconds}s", sec
+
 def get_user_info(chat_id):
     data = load_data()
     return data.get(str(chat_id), {})
@@ -141,6 +169,8 @@ T = {
         "list": "📋 منتجاتي",
         "check": "🔍 فحص الأسعار",
         "subscribe": "💎 الاشتراك",
+        "dashboard": "📌 داشبورد",
+        "delete": "🗑️ حذف",
         "stats": "📊 إحصائياتي",
         "help": "❓ مساعدة",
         "contact": "💬 تواصل مع الأدمن",
@@ -167,10 +197,11 @@ T = {
         "sub_active": (
             "💎 *اشتراكك نشط!*\n\n"
             "📅 ينتهي في: *{date}*\n"
-            "⏳ متبقي: *{days}* يوم\n\n"
+            "⏳ متبقي: *{days}* يوم\n"
+            "⏱️ بالثواني: *{secs}* ثانية\n\n"
             "استمتع بكل المميزات 🚀"
         ),
-        "choose_plan": "اختار الباقة:",
+"choose_plan": "اختار الباقة:",
         "choose_payment": "💳 اختار طريقة الدفع:",
         "payment_instructions": (
             "📋 *تعليمات الدفع*\n\n"
@@ -308,6 +339,8 @@ T = {
         "list": "📋 My Products",
         "check": "🔍 Check Prices",
         "subscribe": "💎 Subscribe",
+        "dashboard": "📌 Dashboard",
+        "delete": "🗑️ Delete",
         "stats": "📊 My Stats",
         "help": "❓ Help",
         "contact": "💬 Contact Admin",
@@ -330,7 +363,8 @@ T = {
             "   • Yearly = 500 EGP\n\n"
             "Choose your plan 👇"
         ),
-        "sub_active": "💎 *Active Subscription!*\n\n📅 Expires: *{date}*\n⏳ Days left: *{days}*\n\nEnjoy! 🚀",
+        "sub_active": "💎 *Active Subscription!*\n\n📅 Expires: *{date}*\n⏳ Days left: *{days}*\n⏱️ Seconds left: *{secs}*\n\nEnjoy! 🚀",
+
         "choose_plan": "Choose your plan:",
         "choose_payment": "💳 Choose payment method:",
         "payment_instructions": (
@@ -406,12 +440,14 @@ T = {
 def main_keyboard(chat_id):
     lang = get_lang(chat_id)
     txt = T[lang]
+    # زرار الاشتراك + الداشبورد تحت زي اللي في الصورة
     return ReplyKeyboardMarkup([
-        [KeyboardButton(txt["add"]),   KeyboardButton(txt["watch_site"])],
-        [KeyboardButton(txt["list"]),  KeyboardButton(txt["check"])],
-        [KeyboardButton(txt["stats"]), KeyboardButton(txt["help"])],
-        [KeyboardButton(txt["contact"]), KeyboardButton(txt["language"])],
-        [KeyboardButton(txt["subscribe"])],
+        [KeyboardButton(txt["add"]),      KeyboardButton(txt["watch_site"])],
+        [KeyboardButton(txt["list"]),     KeyboardButton(txt["check"])],
+        [KeyboardButton(txt["delete"]),   KeyboardButton(txt["stats"])],
+        [KeyboardButton(txt["help"]),     KeyboardButton(txt["contact"])],
+        [KeyboardButton(txt["language"]), KeyboardButton(txt["subscribe"])],
+        [KeyboardButton(txt["dashboard"])],
     ], resize_keyboard=True)
 
 def admin_keyboard():
@@ -520,8 +556,9 @@ async def subscribe_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sub = data[str(chat_id)]["subscription"]
         expiry = datetime.fromisoformat(sub["expiry"])
         days = (expiry - datetime.now()).days
+        secs = remaining_seconds(chat_id)
         await update.message.reply_text(
-            t(chat_id, "sub_active", date=expiry.strftime("%Y-%m-%d"), days=days),
+            t(chat_id, "sub_active", date=expiry.strftime("%Y-%m-%d"), days=days, secs=secs),
             parse_mode="Markdown",
             reply_markup=main_keyboard(chat_id)
         )
@@ -1159,6 +1196,76 @@ async def admin_broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ تم الإرسال لـ {sent} مستخدم", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
+
+
+# ══════════════════════════════════════════
+# داشبورد المستخدم
+# ══════════════════════════════════════════
+async def dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    data = load_data()
+    u = data.get(str(chat_id), {})
+    name = u.get("name") or get_name(update.effective_user)
+    products = len(u.get("products", {}))
+    sites = len(u.get("sites", {}))
+    lang = get_lang(chat_id)
+
+    if is_premium(chat_id):
+        expiry = get_subscription_expiry(chat_id)
+        sec = remaining_seconds(chat_id)
+        human, total = format_remaining_seconds(sec)
+        expiry_s = expiry.strftime("%Y-%m-%d %H:%M") if expiry else "—"
+        plan_line = f"💎 بريميوم\n📅 ينتهي: *{expiry_s}*\n⏱️ متبقي: *{human}*\n🔢 بالثواني: *{total}*"
+    else:
+        plan_line = f"🆓 مجاني (حد {FREE_LIMIT} منتجات)\n💎 اشترك عشان تفتح كل المميزات"
+
+    if lang == "ar":
+        text = (
+            f"📌 *داشبوردك يا {name}*\n\n"
+            f"📦 منتجات: *{products}*\n"
+            f"🌐 مواقع: *{sites}*\n"
+            f"{plan_line}\n\n"
+            "اختر زرار من تحت 👇"
+        )
+    else:
+        expiry = get_subscription_expiry(chat_id)
+        sec = remaining_seconds(chat_id)
+        human, total = format_remaining_seconds(sec)
+        expiry_s = expiry.strftime("%Y-%m-%d %H:%M") if expiry else "—"
+        plan_line_en = (
+            f"💎 Premium\nExpires: *{expiry_s}*\nTime left: *{human}*\nSeconds: *{total}*"
+            if is_premium(chat_id) else f"🆓 Free (limit {FREE_LIMIT} products)\nSubscribe for full access"
+        )
+        text = (
+            f"📌 *Your Dashboard, {name}*\n\n"
+            f"📦 Products: *{products}*\n"
+            f"🌐 Sites: *{sites}*\n"
+            f"{plan_line_en}\n\n"
+            "Use the buttons below 👇"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(chat_id))
+
+# ══════════════════════════════════════════
+# أوامر الأدمن (Status سريع)
+# ══════════════════════════════════════════
+async def admin_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_ID:
+        return
+    data = load_data()
+    users = [k for k in data.keys() if k.isdigit()]
+    premium_users = [k for k in users if is_premium(int(k))]
+    pending = [v for v in data.get("pending_payments", {}).values() if v["status"] == "pending"]
+    await update.message.reply_text(
+        f"🧾 *Status*\n\n"
+        f"👥 Users: *{len(users)}*\n"
+        f"💎 Premium: *{len(premium_users)}*\n"
+        f"🆓 Free: *{len(users) - len(premium_users)}*\n"
+        f"⏳ Pending payments: *{len(pending)}*",
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard()
+    )
 # ══════════════════════════════════════════
 # إحصائيات ومساعدة
 # ══════════════════════════════════════════
@@ -1298,6 +1405,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == txt["stats"]:      await stats(update, ctx)
     elif text == txt["help"]:       await help_cmd(update, ctx)
     elif text == txt["subscribe"]:  await subscribe_menu(update, ctx)
+    elif text == txt["dashboard"]:  await dashboard(update, ctx)
 
 async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_receipt(update, ctx)
@@ -1373,7 +1481,10 @@ def main():
     )
 
     broadcast_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^📢 رسالة للكل$"), admin_broadcast_start)],
+        entry_points=[
+            CommandHandler("broadcast", admin_broadcast_start),
+            MessageHandler(filters.Regex(r"^📢 رسالة للكل$"), admin_broadcast_start)
+        ],
         states={
             WAITING_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)],
         },
@@ -1383,6 +1494,13 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CommandHandler("status", admin_status))
+    app.add_handler(CommandHandler("plan", subscribe_menu))
+    app.add_handler(CommandHandler("my", list_products))
+    app.add_handler(CommandHandler("check", check_prices))
+    app.add_handler(CommandHandler("delete", delete_menu))
+
     app.add_handler(CallbackQueryHandler(lang_callback,          pattern=r"^lang_"))
     app.add_handler(CallbackQueryHandler(plan_callback,          pattern=r"^plan_"))
     app.add_handler(CallbackQueryHandler(payment_method_callback,pattern=r"^pay_"))
